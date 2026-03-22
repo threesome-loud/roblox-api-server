@@ -5,77 +5,69 @@ const Archiver = require('archiver');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-const ACCESS_KEY = "mandem"; // Your C# key
-
-// Mimic a real browser to avoid Roblox 403 blocks
-const http = axios.create({
-    headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': 'https://www.roblox.com',
-        'Referer': 'https://www.roblox.com/'
-    }
-});
+const ACCESS_KEY = "mandem"; 
+const PROXY_API_KEY = "9ba79628-4f3a-42fa-a584-dd98798d9fe4"; // Put your WebScraping.ai key here
 
 app.get('/client/avatar/:userId', async (req, res) => {
     const { userId } = req.params;
     const clientKey = req.headers['x-api-key'];
 
-    console.log(`Request for User: ${userId} | Key: ${clientKey}`);
+    console.log(`Request for User: ${userId}`);
 
     if (clientKey !== ACCESS_KEY) {
-        console.log("Invalid API Key provided.");
         return res.status(403).send("Unauthorized");
     }
 
     try {
-        // 1. Get the 3D Avatar Config
-        // We use the thumbnail API first to get the URL of the actual json config
-        const thumbUrl = `https://thumbnails.roblox.com/v1/users/avatar-3d?userId=${userId}`;
-        const thumbRes = await http.get(thumbUrl);
+        // 1. Get the 3D Config via Residential Proxy (Bypasses Roblox 403)
+        const robloxUrl = `https://thumbnails.roblox.com/v1/users/avatar-3d?userId=${userId}`;
+        const proxyUrl = `https://api.webscraping.ai/html?api_key=${PROXY_API_KEY}&url=${encodeURIComponent(robloxUrl)}&proxy=residential`;
         
-        if (!thumbRes.data || !thumbRes.data.imageUrl) {
-            return res.status(404).send("Roblox could not generate 3D data for this user.");
-        }
+        console.log("Fetching Roblox config via proxy...");
+        const thumbRes = await axios.get(proxyUrl);
+        
+        // WebScraping.ai returns the HTML/JSON string; we parse it if it's a string
+        const data = typeof thumbRes.data === 'string' ? JSON.parse(thumbRes.data) : thumbRes.data;
+        const configUrl = data.imageUrl;
 
-        // 2. Download the actual scene config (contains hashes for obj, mtl, textures)
-        const sceneRes = await http.get(thumbRes.data.imageUrl);
-        const scene = sceneRes.data;
+        if (!configUrl) return res.status(404).send("Avatar data not found.");
 
+        // 2. Fetch the Scene JSON (Usually doesn't need proxy, but we use it to be safe)
+        const sceneRes = await axios.get(`https://api.webscraping.ai/html?api_key=${PROXY_API_KEY}&url=${encodeURIComponent(configUrl)}`);
+        const scene = typeof sceneRes.data === 'string' ? JSON.parse(sceneRes.data) : sceneRes.data;
+
+        // 3. Prepare ZIP
         const archive = Archiver('zip');
         res.attachment(`avatar_${userId}.zip`);
         archive.pipe(res);
 
         const cdn = "https://t6.rbxcdn.com/";
 
-        // Helper to download from Roblox CDN
-        const downloadAsset = (hash) => http.get(`${cdn}${hash}`, { responseType: 'arraybuffer' });
+        // 4. Download Assets (CDN usually doesn't block data centers, saving proxy credits)
+        const [mtlReq, objReq] = await Promise.all([
+            axios.get(`${cdn}${scene.mtl}`, { responseType: 'arraybuffer' }),
+            axios.get(`${cdn}${scene.obj}`, { responseType: 'arraybuffer' })
+        ]);
 
-        // 3. Download and Fix MTL
-        const mtlReq = await downloadAsset(scene.mtl);
         let mtlText = mtlReq.data.toString();
-        
         scene.textures.forEach((hash, i) => {
             mtlText = mtlText.split(hash).join(`tex${i}.png`);
         });
-        archive.append(mtlText, { name: 'model.mtl' });
 
-        // 4. Download OBJ
-        const objReq = await downloadAsset(scene.obj);
+        archive.append(mtlText, { name: 'model.mtl' });
         archive.append(objReq.data, { name: 'model.obj' });
 
-        // 5. Download Textures
         for (let i = 0; i < scene.textures.length; i++) {
-            const texReq = await downloadAsset(scene.textures[i]);
-            archive.append(texReq.data, { name: `tex${i}.png` });
+            const tex = await axios.get(`${cdn}${scene.textures[i]}`, { responseType: 'arraybuffer' });
+            archive.append(tex.data, { name: `tex${i}.png` });
         }
 
-        console.log(`Finalizing ZIP for ${userId}...`);
         await archive.finalize();
+        console.log("Success!");
 
     } catch (error) {
-        console.error("Roblox API Error Detail:", error.response ? error.response.status : error.message);
-        res.status(500).send("Roblox blocked the request (403). Try redeploying your server to get a new IP.");
+        console.error("Error:", error.message);
+        res.status(500).send("Proxy/Roblox Error: " + error.message);
     }
 });
 
