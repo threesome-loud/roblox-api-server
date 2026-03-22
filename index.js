@@ -4,46 +4,44 @@ const Archiver = require('archiver');
 const app = express();
 
 const ACCESS_KEY = "mandem"; 
-const PROXY_API_KEY = "9ba79628-4f3a-42fa-a584-dd98798d9fe4"; // Ensure this is correct!
+const PROXY_API_KEY = "9ba79628-4f3a-42fa-a584-dd98798d9fe4"; // Double check this!
 
 app.get('/client/avatar/:userId', async (req, res) => {
     const { userId } = req.params;
     if (req.headers['x-api-key'] !== ACCESS_KEY) return res.status(403).send("Unauthorized");
 
     try {
-        // 1. Fetch from Proxy
+        // 1. Fetch via Proxy with RESIDENTIAL IP and HEADERS enabled
+        // We add &proxy=residential and &headers=true
         const robloxUrl = encodeURIComponent(`https://thumbnails.roblox.com/v1/users/avatar-3d?userId=${userId}`);
-        const proxyUrl = `https://api.webscraping.ai/html?api_key=${PROXY_API_KEY}&url=${robloxUrl}&proxy=residential`;
+        const proxyUrl = `https://api.webscraping.ai/html?api_key=${PROXY_API_KEY}&url=${robloxUrl}&proxy=residential&headers=true`;
         
-        const thumbRes = await axios.get(proxyUrl);
+        console.log(`Bypassing Roblox for user ${userId}...`);
         
-        // Ensure data is an object
+        const thumbRes = await axios.get(proxyUrl, { timeout: 30000 });
+        
         let data = thumbRes.data;
-        if (typeof data === 'string') {
-            try { data = JSON.parse(data); } catch(e) { throw new Error("Roblox returned invalid JSON via proxy"); }
-        }
+        if (typeof data === 'string') data = JSON.parse(data);
         
-        if (!data || !data.imageUrl) throw new Error("No imageUrl found in Roblox response");
+        if (!data.imageUrl) throw new Error("Roblox denied request (403 still active or invalid ID)");
 
-        // 2. Fetch Scene Config
+        // 2. Fetch Scene Config (CDN is usually safe, no proxy needed)
         const sceneRes = await axios.get(data.imageUrl);
         const scene = sceneRes.data;
         const cdn = "https://t6.rbxcdn.com/";
 
         // 3. Create ZIP
-        const archive = Archiver('zip', { zlib: { level: 5 } });
+        const archive = Archiver('zip');
         res.attachment(`avatar_${userId}.zip`);
         archive.pipe(res);
 
-        // Helper to download to buffer
         const download = async (url) => {
             const r = await axios.get(url, { responseType: 'arraybuffer' });
             return r.data;
         };
 
-        // Add MTL
-        let mtlBuffer = await download(`${cdn}${scene.mtl}`);
-        let mtlText = mtlBuffer.toString();
+        // Add MTL with texture path mapping
+        let mtlText = (await download(`${cdn}${scene.mtl}`)).toString();
         scene.textures.forEach((hash, i) => {
             mtlText = mtlText.split(hash).join(`tex${i}.png`);
         });
@@ -58,13 +56,11 @@ app.get('/client/avatar/:userId', async (req, res) => {
         }
 
         await archive.finalize();
+        console.log("Download complete!");
 
     } catch (err) {
-        console.error("SERVER ERROR:", err.message);
-        // This sends the actual error message back to your C# app so you can see it
-        if (!res.headersSent) {
-            res.status(500).send(err.message);
-        }
+        console.error("CRITICAL ERROR:", err.message);
+        if (!res.headersSent) res.status(500).send(err.message);
     }
 });
 
