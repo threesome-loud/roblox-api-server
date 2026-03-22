@@ -5,15 +5,18 @@ const Archiver = require('archiver');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// IMPORTANT: This must match your C# code exactly
-const ACCESS_KEY = "mandem";
+const ACCESS_KEY = "mandem"; // Your C# key
 
-async function fetchAsset(hash) {
-    const response = await axios.get(`https://t6.rbxcdn.com/${hash}`, { responseType: 'arraybuffer' });
-    return response.data;
-}
+// Mimic a real browser to avoid Roblox 403 blocks
+const http = axios.create({
+    headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Origin': 'https://www.roblox.com',
+        'Referer': 'https://www.roblox.com/'
+    }
+});
 
-// This route matches: /client/avatar/USERID
 app.get('/client/avatar/:userId', async (req, res) => {
     const { userId } = req.params;
     const clientKey = req.headers['x-api-key'];
@@ -21,41 +24,59 @@ app.get('/client/avatar/:userId', async (req, res) => {
     console.log(`Request for User: ${userId} | Key: ${clientKey}`);
 
     if (clientKey !== ACCESS_KEY) {
+        console.log("Invalid API Key provided.");
         return res.status(403).send("Unauthorized");
     }
 
     try {
-        const thumbRes = await axios.get(`https://thumbnails.roblox.com/v1/users/avatar-3d?userId=${userId}`);
-        const configUrl = thumbRes.data.imageUrl;
-        if (!configUrl) return res.status(404).send("Avatar not found.");
+        // 1. Get the 3D Avatar Config
+        // We use the thumbnail API first to get the URL of the actual json config
+        const thumbUrl = `https://thumbnails.roblox.com/v1/users/avatar-3d?userId=${userId}`;
+        const thumbRes = await http.get(thumbUrl);
+        
+        if (!thumbRes.data || !thumbRes.data.imageUrl) {
+            return res.status(404).send("Roblox could not generate 3D data for this user.");
+        }
 
-        const sceneRes = await axios.get(configUrl);
+        // 2. Download the actual scene config (contains hashes for obj, mtl, textures)
+        const sceneRes = await http.get(thumbRes.data.imageUrl);
         const scene = sceneRes.data;
 
         const archive = Archiver('zip');
         res.attachment(`avatar_${userId}.zip`);
         archive.pipe(res);
 
-        // Fix MTL
-        let mtlText = (await fetchAsset(scene.mtl)).toString();
+        const cdn = "https://t6.rbxcdn.com/";
+
+        // Helper to download from Roblox CDN
+        const downloadAsset = (hash) => http.get(`${cdn}${hash}`, { responseType: 'arraybuffer' });
+
+        // 3. Download and Fix MTL
+        const mtlReq = await downloadAsset(scene.mtl);
+        let mtlText = mtlReq.data.toString();
+        
         scene.textures.forEach((hash, i) => {
             mtlText = mtlText.split(hash).join(`tex${i}.png`);
         });
-
         archive.append(mtlText, { name: 'model.mtl' });
-        archive.append(await fetchAsset(scene.obj), { name: 'model.obj' });
 
+        // 4. Download OBJ
+        const objReq = await downloadAsset(scene.obj);
+        archive.append(objReq.data, { name: 'model.obj' });
+
+        // 5. Download Textures
         for (let i = 0; i < scene.textures.length; i++) {
-            const texData = await fetchAsset(scene.textures[i]);
-            archive.append(texData, { name: `tex${i}.png` });
+            const texReq = await downloadAsset(scene.textures[i]);
+            archive.append(texReq.data, { name: `tex${i}.png` });
         }
 
-        archive.finalize();
-        console.log(`Success: Sent avatar for ${userId}`);
+        console.log(`Finalizing ZIP for ${userId}...`);
+        await archive.finalize();
+
     } catch (error) {
-        console.error("Error:", error.message);
-        res.status(500).send("Roblox API Error");
+        console.error("Roblox API Error Detail:", error.response ? error.response.status : error.message);
+        res.status(500).send("Roblox blocked the request (403). Try redeploying your server to get a new IP.");
     }
 });
 
-app.listen(PORT, () => console.log(`Server live on port ${PORT}`));
+app.listen(PORT, "0.0.0.0", () => console.log(`Server live on port ${PORT}`));
